@@ -1,5 +1,8 @@
 # MCP GDB Server
 
+[![npm version](https://img.shields.io/npm/v/mcp-gdb.svg)](https://www.npmjs.com/package/mcp-gdb)
+[![license](https://img.shields.io/npm/l/mcp-gdb.svg)](https://github.com/signal-slot/mcp-gdb/blob/main/LICENSE)
+
 A Model Context Protocol (MCP) server that provides GDB debugging functionality for use with Claude or other AI assistants.
 
 ## Features
@@ -12,15 +15,28 @@ A Model Context Protocol (MCP) server that provides GDB debugging functionality 
 
 ## Installation
 
+### Option 1: Install from NPM
+
+```bash
+npm install mcp-gdb
+```
+
+You can use the package in your Node.js project:
+
+```javascript
+import { startGdbServer } from 'mcp-gdb';
+
+// Start the server programmatically
+startGdbServer();
+```
+
+### Option 2: Install from Source
+
 ```bash
 # Clone the repository
 git clone https://github.com/signal-slot/mcp-gdb.git
 cd mcp-gdb
-
-# Install dependencies
 npm install
-
-# Build the project
 npm run build
 ```
 
@@ -34,8 +50,22 @@ npm run build
 {
   "mcpServers": {
     "gdb": {
-      "command": "node",
+      "command": "node", 
       "args": ["/path/to/mcp-gdb/build/index.js"],
+      "disabled": false
+    }
+  }
+}
+```
+
+If you installed via NPM, you can reference the package in node_modules:
+
+```json
+{
+  "mcpServers": {
+    "gdb": {
+      "command": "node",
+      "args": ["node_modules/mcp-gdb/build/index.js"],
       "disabled": false
     }
   }
@@ -84,6 +114,17 @@ Use gdb_backtrace to see the current call stack
 ```
 Use gdb_terminate to end the debugging session
 ```
+
+## NPM Package Information
+
+The `mcp-gdb` package is available on [npm](https://www.npmjs.com/package/mcp-gdb) and provides all the functionality needed to integrate GDB debugging with MCP-enabled AI assistants.
+
+- **Current Version**: 0.1.0
+- **Main**: build/index.js
+- **Type**: ESM module
+- **License**: MIT
+- **Keywords**: gdb, debug, mcp
+- **Repository**: [GitHub](https://github.com/signal-slot/mcp-gdb)
 
 ## Supported GDB Commands
 
