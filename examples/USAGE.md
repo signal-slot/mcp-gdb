@@ -291,3 +291,62 @@ Then load the program and core dump:
 ```
 
 Then you can analyze the crash just as if you had caught it in real-time.
+
+## VS Code Integration for Source Code Viewing
+
+The MCP GDB server now supports viewing source code in VS Code with the `gdb_list_source` tool:
+
+### Viewing Source Code 
+
+Ask Claude to show you the source code:
+
+```
+Can you show me the source code at our current location?
+```
+
+Claude will use `gdb_list_source`:
+
+```
+<use_mcp_tool>
+<server_name>gdb</server_name>
+<tool_name>gdb_list_source</tool_name>
+<arguments>
+{
+  "sessionId": "1616161616161"
+}
+</arguments>
+</use_mcp_tool>
+```
+
+You can also specify a location:
+
+```
+Can you show me the source code for the function_that_crashes function?
+```
+
+Claude will use:
+
+```
+<use_mcp_tool>
+<server_name>gdb</server_name>
+<tool_name>gdb_list_source</tool_name>
+<arguments>
+{
+  "sessionId": "1616161616161",
+  "location": "function_that_crashes"
+}
+</arguments>
+</use_mcp_tool>
+```
+
+### Opening Source Code in VS Code
+
+The `gdb_list_source` command returns a VS Code URI that can be clicked to open the file directly at the specified line:
+
+```
+Claude's response will include a VS Code URI in this format:
+
+vscode://file/path/to/source/file.c:25
+
+Simply click on this URI in Claude's response, and VS Code will open the file
+at the specified line.

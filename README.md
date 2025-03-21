@@ -11,6 +11,7 @@ A Model Context Protocol (MCP) server that provides GDB debugging functionality 
 - Load programs and core dumps for analysis
 - Set breakpoints, step through code, and examine memory
 - View call stacks, variables, and registers
+- View source code with VS Code integration
 - Execute arbitrary GDB commands
 
 ## Installation
@@ -119,7 +120,7 @@ Use gdb_terminate to end the debugging session
 
 The `mcp-gdb` package is available on [npm](https://www.npmjs.com/package/mcp-gdb) and provides all the functionality needed to integrate GDB debugging with MCP-enabled AI assistants.
 
-- **Current Version**: 0.1.0
+- **Current Version**: 0.1.1
 - **Main**: build/index.js
 - **Type**: ESM module
 - **License**: MIT
@@ -144,6 +145,7 @@ The `mcp-gdb` package is available on [npm](https://www.npmjs.com/package/mcp-gd
 - `gdb_print`: Print value of expression
 - `gdb_examine`: Examine memory
 - `gdb_info_registers`: Display registers
+- `gdb_list_source`: List source code at current location or specified location with VS Code integration
 
 ## License
 

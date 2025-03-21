@@ -349,6 +349,28 @@ class GdbServer {
             },
             required: ['sessionId']
           }
+        },
+        {
+          name: 'gdb_list_source',
+          description: 'List source code at current location or specified location, with VS Code integration',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sessionId: {
+                type: 'string',
+                description: 'GDB session ID'
+              },
+              location: {
+                type: 'string',
+                description: 'Source location (e.g., function name, file:line, optional)'
+              },
+              lineCount: {
+                type: 'number',
+                description: 'Number of lines to show (optional, default is 10)'
+              }
+            },
+            required: ['sessionId']
+          }
         }
       ],
     }));
@@ -388,6 +410,8 @@ class GdbServer {
           return await this.handleGdbExamine(request.params.arguments);
         case 'gdb_info_registers':
           return await this.handleGdbInfoRegisters(request.params.arguments);
+        case 'gdb_list_source':
+          return await this.handleGdbListSource(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1151,6 +1175,123 @@ class GdbServer {
         isError: true
       };
     }
+  }
+
+  private async handleGdbListSource(args: any) {
+    const { sessionId, location, lineCount = 10 } = args;
+    
+    if (!activeSessions.has(sessionId)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No active GDB session with ID: ${sessionId}`
+          }
+        ],
+        isError: true
+      };
+    }
+    
+    const session = activeSessions.get(sessionId)!;
+    
+    try {
+      // Build list command with optional location and line count
+      const command = location ? `list ${location}` : 'list';
+      const output = await this.executeGdbCommand(session, command);
+      
+      // Parse output to extract file and line information
+      const sourceInfo = await this.parseSourceInfoFromGdbOutput(session, output);
+      
+      // If we got valid source information, return it in a structured format
+      if (sourceInfo.filePath) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Source code ${location ? `at ${location}` : 'at current location'}:\n\n${output}`
+            },
+            {
+              type: 'source_location',
+              filePath: sourceInfo.filePath,
+              lineStart: sourceInfo.lineStart, 
+              vscodeUri: `vscode://file${sourceInfo.filePath}:${sourceInfo.lineStart}`,
+              lineEnd: sourceInfo.lineEnd
+            }
+          ]
+        };
+      }
+      
+      // If we couldn't extract source information, just return the text output
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Source code ${location ? `at ${location}` : 'at current location'}:\n\n${output}`
+          }
+        ]
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to list source: ${errorMessage}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+
+  /**
+   * Parse GDB output to extract source code file path and line range
+   */
+  private async parseSourceInfoFromGdbOutput(session: GdbSession, output: string): Promise<{ filePath: string, lineStart: number, lineEnd: number }> {
+    // Default return value when parsing fails
+    const defaultResult = { filePath: '', lineStart: 0, lineEnd: 0 };
+    
+    // Check if the output contains source lines
+    if (!output.trim()) {
+      return defaultResult;
+    }
+    
+    try {
+      // First, try to extract the file path and line numbers from the list output
+      // Format for GDB list output is usually line numbers followed by the code:
+      // 10     void function_with_args(int a, int b) {
+      
+      const lines = output.split('\n').filter(line => line.trim());
+      
+      // Detect if there's source code in the output
+      // Look for lines that start with numbers
+      const sourceLines = lines.filter(line => /^\s*\d+\s+/.test(line));
+      
+      if (sourceLines.length === 0) {
+        return defaultResult;
+      }
+      
+      // Extract line numbers from the first and last source lines
+      const firstLineMatch = sourceLines[0].match(/^\s*(\d+)\s+/);
+      const lastLineMatch = sourceLines[sourceLines.length - 1].match(/^\s*(\d+)\s+/);
+      
+      if (firstLineMatch && lastLineMatch) {
+        // If we couldn't extract line numbers, get the current source file
+        const infoOutput = await this.executeGdbCommand(session, 'info source');
+        const filePathMatch = infoOutput.match(/Current source file is (.*?)(?: |$)/);
+        const filePath = filePathMatch ? filePathMatch[1] : '';
+        
+        return {
+          filePath,
+          lineStart: parseInt(firstLineMatch[1], 10),
+          lineEnd: parseInt(lastLineMatch[1], 10)
+        };
+      }
+    } catch (e) {
+      // If there's any error in parsing, continue with default result
+    }
+    
+    return defaultResult;
   }
 
   /**
