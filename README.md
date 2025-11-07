@@ -2,6 +2,10 @@
 
 A Model Context Protocol (MCP) server that provides GDB debugging functionality for use with Claude or other AI assistants.
 
+<a href="https://glama.ai/mcp/servers/@signal-slot/mcp-gdb">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@signal-slot/mcp-gdb/badge" alt="GDB Server MCP server" />
+</a>
+
 ## Features
 
 - Start and manage GDB debugging sessions
