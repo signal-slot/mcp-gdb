@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/signal-slot-mcp-gdb-badge.png)](https://mseep.ai/app/signal-slot-mcp-gdb)
+
 # MCP GDB Server
 
 A Model Context Protocol (MCP) server that provides GDB debugging functionality for use with Claude or other AI assistants.
