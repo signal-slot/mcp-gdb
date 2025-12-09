@@ -352,7 +352,7 @@ class GdbServer {
         },
         {
           name: 'gdb_interrupt',
-          description: 'Send SIGINT (Ctrl+C) to interrupt a running program',
+          description: 'Send Ctrl+C to interrupt a running program',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1187,8 +1187,13 @@ class GdbServer {
     const session = activeSessions.get(sessionId)!;
 
     try {
-      // Send SIGINT to the GDB process to interrupt the running program
-      session.process.kill('SIGINT');
+      // Send Ctrl+C (ASCII 0x03) to GDB's stdin to interrupt the running program
+      // This is more reliable than sending SIGINT, especially on Windows
+      if (session.process.stdin) {
+        session.process.stdin.write('\x03');
+      } else {
+        throw new Error('GDB stdin is not available');
+      }
 
       // Wait a bit for GDB to process the interrupt and return to prompt
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -1197,7 +1202,7 @@ class GdbServer {
         content: [
           {
             type: 'text',
-            text: `Sent SIGINT to GDB session ${sessionId}. Program should be interrupted.`
+            text: `Sent Ctrl+C to GDB session ${sessionId}. Program should be interrupted.`
           }
         ]
       };
