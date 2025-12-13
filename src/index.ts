@@ -42,7 +42,7 @@ class GdbServer {
     );
 
     this.setupToolHandlers();
-    
+
     // Error handling
     this.server.onerror = (error) => console.error('[MCP Error]', error);
     process.on('SIGINT', async () => {
@@ -349,6 +349,20 @@ class GdbServer {
             },
             required: ['sessionId']
           }
+        },
+        {
+          name: 'gdb_interrupt',
+          description: 'Send Ctrl+C to interrupt a running program',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sessionId: {
+                type: 'string',
+                description: 'GDB session ID'
+              }
+            },
+            required: ['sessionId']
+          }
         }
       ],
     }));
@@ -388,6 +402,8 @@ class GdbServer {
           return await this.handleGdbExamine(request.params.arguments);
         case 'gdb_info_registers':
           return await this.handleGdbInfoRegisters(request.params.arguments);
+        case 'gdb_interrupt':
+          return await this.handleGdbInterrupt(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -400,10 +416,10 @@ class GdbServer {
   private async handleGdbStart(args: any) {
     const gdbPath = args.gdbPath || 'gdb';
     const workingDir = args.workingDir || process.cwd();
-    
+
     // Create a unique session ID
     const sessionId = Date.now().toString();
-    
+
     try {
       // Start GDB process with MI mode enabled for machine interface
       const gdbProcess = spawn(gdbPath, ['--interpreter=mi'], {
@@ -411,13 +427,13 @@ class GdbServer {
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe']
       });
-      
+
       // Create readline interface for reading GDB output
       const rl = readline.createInterface({
         input: gdbProcess.stdout,
         terminal: false
       });
-      
+
       // Create new GDB session
       const session: GdbSession = {
         process: gdbProcess,
@@ -426,23 +442,23 @@ class GdbServer {
         id: sessionId,
         workingDir
       };
-      
+
       // Store session in active sessions map
       activeSessions.set(sessionId, session);
-      
+
       // Collect GDB output until ready
       let outputBuffer = '';
-      
+
       // Wait for GDB to be ready (when it outputs the initial prompt)
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('GDB start timeout'));
         }, 10000); // 10 second timeout
-        
+
         rl.on('line', (line) => {
           // Append line to output buffer
           outputBuffer += line + '\n';
-          
+
           // Check if GDB is ready (outputs prompt)
           if (line.includes('(gdb)') || line.includes('^done')) {
             clearTimeout(timeout);
@@ -450,16 +466,16 @@ class GdbServer {
             resolve();
           }
         });
-        
+
         gdbProcess.stderr.on('data', (data) => {
           outputBuffer += `[stderr] ${data.toString()}\n`;
         });
-        
+
         gdbProcess.on('error', (err) => {
           clearTimeout(timeout);
           reject(err);
         });
-        
+
         gdbProcess.on('exit', (code) => {
           clearTimeout(timeout);
           if (!session.ready) {
@@ -467,7 +483,7 @@ class GdbServer {
           }
         });
       });
-      
+
       return {
         content: [
           {
@@ -484,7 +500,7 @@ class GdbServer {
         session.rl.close();
         activeSessions.delete(sessionId);
       }
-      
+
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
         content: [
@@ -500,7 +516,7 @@ class GdbServer {
 
   private async handleGdbLoad(args: any) {
     const { sessionId, program, arguments: programArgs = [] } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -512,29 +528,29 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Normalize path if working directory is set
-      const normalizedPath = session.workingDir && !path.isAbsolute(program) 
+      const normalizedPath = session.workingDir && !path.isAbsolute(program)
         ? path.resolve(session.workingDir, program)
         : program;
-      
+
       // Update session target
       session.target = normalizedPath;
-      
+
       // Execute file command to load program
       const loadCommand = `file "${normalizedPath}"`;
       const loadOutput = await this.executeGdbCommand(session, loadCommand);
-      
+
       // Set program arguments if provided
       let argsOutput = '';
       if (programArgs.length > 0) {
         const argsCommand = `set args ${programArgs.join(' ')}`;
         argsOutput = await this.executeGdbCommand(session, argsCommand);
       }
-      
+
       return {
         content: [
           {
@@ -559,7 +575,7 @@ class GdbServer {
 
   private async handleGdbCommand(args: any) {
     const { sessionId, command } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -571,12 +587,12 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       const output = await this.executeGdbCommand(session, command);
-      
+
       return {
         content: [
           {
@@ -601,7 +617,7 @@ class GdbServer {
 
   private async handleGdbTerminate(args: any) {
     const { sessionId } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -613,10 +629,10 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     try {
       await this.terminateGdbSession(sessionId);
-      
+
       return {
         content: [
           {
@@ -645,7 +661,7 @@ class GdbServer {
       target: session.target || 'No program loaded',
       workingDir: session.workingDir || process.cwd()
     }));
-    
+
     return {
       content: [
         {
@@ -658,7 +674,7 @@ class GdbServer {
 
   private async handleGdbAttach(args: any) {
     const { sessionId, pid } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -670,12 +686,12 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       const output = await this.executeGdbCommand(session, `attach ${pid}`);
-      
+
       return {
         content: [
           {
@@ -700,7 +716,7 @@ class GdbServer {
 
   private async handleGdbLoadCore(args: any) {
     const { sessionId, program, corePath } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -712,19 +728,19 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // First load the program
       const fileOutput = await this.executeGdbCommand(session, `file "${program}"`);
-      
+
       // Then load the core file
       const coreOutput = await this.executeGdbCommand(session, `core-file "${corePath}"`);
-      
+
       // Get backtrace to show initial state
       const backtraceOutput = await this.executeGdbCommand(session, "backtrace");
-      
+
       return {
         content: [
           {
@@ -749,7 +765,7 @@ class GdbServer {
 
   private async handleGdbSetBreakpoint(args: any) {
     const { sessionId, location, condition } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -761,14 +777,14 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Set breakpoint
       let command = `break ${location}`;
       const output = await this.executeGdbCommand(session, command);
-      
+
       // Set condition if provided
       let conditionOutput = '';
       if (condition) {
@@ -780,7 +796,7 @@ class GdbServer {
           conditionOutput = await this.executeGdbCommand(session, conditionCommand);
         }
       }
-      
+
       return {
         content: [
           {
@@ -805,7 +821,7 @@ class GdbServer {
 
   private async handleGdbContinue(args: any) {
     const { sessionId } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -817,12 +833,12 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       const output = await this.executeGdbCommand(session, "continue");
-      
+
       return {
         content: [
           {
@@ -847,7 +863,7 @@ class GdbServer {
 
   private async handleGdbStep(args: any) {
     const { sessionId, instructions = false } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -859,14 +875,14 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Use stepi for instruction-level stepping, otherwise step
       const command = instructions ? "stepi" : "step";
       const output = await this.executeGdbCommand(session, command);
-      
+
       return {
         content: [
           {
@@ -891,7 +907,7 @@ class GdbServer {
 
   private async handleGdbNext(args: any) {
     const { sessionId, instructions = false } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -903,14 +919,14 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Use nexti for instruction-level stepping, otherwise next
       const command = instructions ? "nexti" : "next";
       const output = await this.executeGdbCommand(session, command);
-      
+
       return {
         content: [
           {
@@ -935,7 +951,7 @@ class GdbServer {
 
   private async handleGdbFinish(args: any) {
     const { sessionId } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -947,12 +963,12 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       const output = await this.executeGdbCommand(session, "finish");
-      
+
       return {
         content: [
           {
@@ -977,7 +993,7 @@ class GdbServer {
 
   private async handleGdbBacktrace(args: any) {
     const { sessionId, full = false, limit } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -989,18 +1005,18 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Build backtrace command with options
       let command = full ? "backtrace full" : "backtrace";
       if (typeof limit === 'number') {
         command += ` ${limit}`;
       }
-      
+
       const output = await this.executeGdbCommand(session, command);
-      
+
       return {
         content: [
           {
@@ -1025,7 +1041,7 @@ class GdbServer {
 
   private async handleGdbPrint(args: any) {
     const { sessionId, expression } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -1037,12 +1053,12 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       const output = await this.executeGdbCommand(session, `print ${expression}`);
-      
+
       return {
         content: [
           {
@@ -1067,7 +1083,7 @@ class GdbServer {
 
   private async handleGdbExamine(args: any) {
     const { sessionId, expression, format = 'x', count = 1 } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -1079,14 +1095,14 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Format examine command: x/[count][format] [expression]
       const command = `x/${count}${format} ${expression}`;
       const output = await this.executeGdbCommand(session, command);
-      
+
       return {
         content: [
           {
@@ -1111,7 +1127,7 @@ class GdbServer {
 
   private async handleGdbInfoRegisters(args: any) {
     const { sessionId, register } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -1123,14 +1139,14 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Build info registers command, optionally with specific register
       const command = register ? `info registers ${register}` : `info registers`;
       const output = await this.executeGdbCommand(session, command);
-      
+
       return {
         content: [
           {
@@ -1153,6 +1169,57 @@ class GdbServer {
     }
   }
 
+  private async handleGdbInterrupt(args: any) {
+    const { sessionId } = args;
+
+    if (!activeSessions.has(sessionId)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No active GDB session with ID: ${sessionId}`
+          }
+        ],
+        isError: true
+      };
+    }
+
+    const session = activeSessions.get(sessionId)!;
+
+    try {
+      // Send Ctrl+C (ASCII 0x03) to GDB's stdin to interrupt the running program
+      // This is more reliable than sending SIGINT, especially on Windows
+      if (session.process.stdin) {
+        session.process.stdin.write('\x03');
+      } else {
+        throw new Error('GDB stdin is not available');
+      }
+
+      // Wait a bit for GDB to process the interrupt and return to prompt
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Sent Ctrl+C to GDB session ${sessionId}. Program should be interrupted.`
+          }
+        ]
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to interrupt program: ${errorMessage}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+
   /**
    * Execute a GDB command and wait for the response
    */
@@ -1162,7 +1229,7 @@ class GdbServer {
         reject(new Error('GDB session is not ready'));
         return;
       }
-      
+
       // Write command to GDB's stdin
       if (session.process.stdin) {
         session.process.stdin.write(command + '\n');
@@ -1170,18 +1237,18 @@ class GdbServer {
         reject(new Error('GDB stdin is not available'));
         return;
       }
-      
+
       let output = '';
       let responseComplete = false;
-      
+
       // Create a one-time event handler for GDB output
       const onLine = (line: string) => {
         output += line + '\n';
-        
+
         // Check if this line indicates the end of the GDB response
         if (line.includes('(gdb)') || line.includes('^done') || line.includes('^error')) {
           responseComplete = true;
-          
+
           // If we've received the complete response, resolve the promise
           if (responseComplete) {
             // Remove the listener to avoid memory leaks
@@ -1190,27 +1257,27 @@ class GdbServer {
           }
         }
       };
-      
+
       // Add the line handler to the readline interface
       session.rl.on('line', onLine);
-      
+
       // Set a timeout to prevent hanging
       const timeout = setTimeout(() => {
         session.rl.removeListener('line', onLine);
         reject(new Error('GDB command timed out'));
       }, 10000); // 10 second timeout
-      
+
       // Handle GDB errors
       const errorHandler = (data: Buffer) => {
         const errorText = data.toString();
         output += `[stderr] ${errorText}\n`;
       };
-      
+
       // Add error handler
       if (session.process.stderr) {
         session.process.stderr.once('data', errorHandler);
       }
-      
+
       // Clean up event handlers when the timeout expires
       timeout.unref();
     });
@@ -1223,24 +1290,24 @@ class GdbServer {
     if (!activeSessions.has(sessionId)) {
       throw new Error(`No active GDB session with ID: ${sessionId}`);
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     // Send quit command to GDB
     try {
       await this.executeGdbCommand(session, 'quit');
     } catch (error) {
       // Ignore errors from quit command, we'll force kill if needed
     }
-    
+
     // Force kill the process if it's still running
     if (!session.process.killed) {
       session.process.kill();
     }
-    
+
     // Close the readline interface
     session.rl.close();
-    
+
     // Remove from active sessions
     activeSessions.delete(sessionId);
   }
