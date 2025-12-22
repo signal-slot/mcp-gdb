@@ -576,11 +576,12 @@ class GdbServer {
           } else if (parsed.data.type === 'exec' && parsed.data.class === 'running') {
             session.status = 'running';
           }
-        } else if (parsed.type === 'stream') {
-          // Accumulate console output
-          if (parsed.data.type === 'console') {
-            session.outputBuffer += parsed.data.content;
-          }
+                  } else if (parsed.type === 'stream') {
+                    // Accumulate console and target output
+                    if (parsed.data.type === 'console' || parsed.data.type === 'target') {
+                      session.outputBuffer += parsed.data.content;
+                    }
+        
         } else if (parsed.type === 'prompt') {
           // (gdb) prompt - indicate ready if not already
           if (!session.ready) {
@@ -728,8 +729,16 @@ class GdbServer {
     const session = activeSessions.get(sessionId)!;
 
     try {
+      let commandToExecute = command;
+      // If it's not a raw MI command, wrap it in interpreter-exec console
+      // This allows users to run normal GDB commands like "source", "list", etc.
+      if (!isMiCommand) {
+        const escapedCommand = command.replace(/"/g, '\\"');
+        commandToExecute = `interpreter-exec console "${escapedCommand}"`;
+      }
+
       // Send command directly as MI command (no wrapper)
-      const { output } = await this.executeGdbCommand(session, command);
+      const { output } = await this.executeGdbCommand(session, commandToExecute);
 
       return {
         content: [
@@ -1201,8 +1210,24 @@ class GdbServer {
         };
       }
 
-      // Wait for stop
-      const stopRecord = await this.waitForStop(session);
+      // Wait for stop with timeout
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 5000); // 5s timeout
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Step initiated but program did not stop within 5s. It might be running or waiting for input.`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
 
       return {
         content: [{
@@ -1245,8 +1270,24 @@ class GdbServer {
         };
       }
 
-      // Wait for stop
-      const stopRecord = await this.waitForStop(session);
+      // Wait for stop with timeout
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 5000); // 5s timeout
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Next initiated but program did not stop within 5s. It might be running or waiting for input.`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
 
       return {
         content: [{
@@ -1288,7 +1329,24 @@ class GdbServer {
         };
       }
 
-      const stopRecord = await this.waitForStop(session);
+      // Wait for stop with timeout
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 5000); // 5s timeout
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Finish initiated but program did not stop within 5s. It might be running or waiting for input.`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
 
       return {
         content: [{
@@ -1516,7 +1574,8 @@ class GdbServer {
 
       // Write command to GDB's stdin with token
       if (session.process.stdin) {
-        session.process.stdin.write(`${token}-${command}\n`);
+        const commandToSend = command.startsWith('-') ? command.substring(1) : command;
+        session.process.stdin.write(`${token}-${commandToSend}\n`);
       } else {
         session.pendingCommands.delete(token);
         reject(new Error('GDB stdin is not available'));
