@@ -1155,6 +1155,14 @@ class GdbServer {
     }
 
     const session = activeSessions.get(sessionId)!;
+    if (session.status === 'stopped') {
+      return {
+        content: [{
+          type: 'text',
+          text: 'Program is already stopped; no interrupt needed.'
+        }]
+      };
+    }
     try {
       if (useSigint) {
         // Send interrupt via SIGINT
@@ -1164,8 +1172,24 @@ class GdbServer {
         await this.executeGdbCommand(session, "exec-interrupt");
       }
 
-      // Wait for stop
-      const stopRecord = await this.waitForStop(session);
+      // Wait for stop, but return if it takes too long
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 2000);
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Interrupt sent (${useSigint ? 'SIGINT' : 'MI-Command'}). Waiting for stop...`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
 
       return {
         content: [{
