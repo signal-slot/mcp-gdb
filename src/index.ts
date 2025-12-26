@@ -11,6 +11,26 @@ import { spawn, ChildProcess } from 'child_process';
 import * as readline from 'readline';
 import * as fs from 'fs';
 import * as path from 'path';
+import { MiParser } from './mi-parser.js';
+
+// GDB MI Output Types
+interface MiResult {
+  token?: number;
+  class: 'done' | 'running' | 'connected' | 'error' | 'exit';
+  data: Record<string, any>;
+}
+
+interface MiAsyncRecord {
+  token?: number;
+  type: 'exec' | 'status' | 'notify';
+  class: string;
+  data: Record<string, any>;
+}
+
+interface MiStreamRecord {
+  type: 'console' | 'target' | 'log';
+  content: string;
+}
 
 // Interface for GDB session
 interface GdbSession {
@@ -20,10 +40,20 @@ interface GdbSession {
   id: string;
   target?: string;
   workingDir?: string;
+
+  // New fields for async handling
+  tokenSequence: number;
+  pendingCommands: Map<number, (result: MiResult) => void>;
+  status: 'stopped' | 'running';
+  stopHandler?: (record: MiAsyncRecord) => void;
+  outputBuffer: string; // Accumulate console output
 }
 
 // Map to store active GDB sessions
 const activeSessions = new Map<string, GdbSession>();
+
+// Server metadata for restart verification
+const SERVER_START_TIME = new Date().toISOString();
 
 class GdbServer {
   private server: Server;
@@ -42,7 +72,7 @@ class GdbServer {
     );
 
     this.setupToolHandlers();
-    
+
     // Error handling
     this.server.onerror = (error) => console.error('[MCP Error]', error);
     process.on('SIGINT', async () => {
@@ -100,9 +130,10 @@ class GdbServer {
             required: ['sessionId', 'program']
           }
         },
+
         {
           name: 'gdb_command',
-          description: 'Execute a GDB command',
+          description: 'Execute a GDB/MI command directly. Send raw MI commands (e.g., -data-evaluate-expression). Note: CLI commands via -interpreter-exec are not supported in many GDB versions.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -112,7 +143,11 @@ class GdbServer {
               },
               command: {
                 type: 'string',
-                description: 'GDB command to execute'
+                description: 'GDB/MI command to execute. For "exec-interrupt" to work during execution, GDB must be in async mode (target-async on).'
+              },
+              isMiCommand: {
+                type: 'boolean',
+                description: 'Set to true if the command is a raw MI command'
               }
             },
             required: ['sessionId', 'command']
@@ -127,6 +162,31 @@ class GdbServer {
               sessionId: {
                 type: 'string',
                 description: 'GDB session ID'
+              }
+            },
+            required: ['sessionId']
+          }
+        },
+        {
+          name: 'gdb_run',
+          description: 'Run the loaded program. Equivalent to "run" command.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sessionId: {
+                type: 'string',
+                description: 'GDB session ID'
+              },
+              arguments: {
+                type: 'array',
+                items: {
+                  type: 'string'
+                },
+                description: 'Command-line arguments for the program (optional)'
+              },
+              awaitStop: {
+                type: 'boolean',
+                description: 'Wait for program to stop (default: true). Set to false to return immediately (non-blocking run). Useful for async execution.'
               }
             },
             required: ['sessionId']
@@ -211,6 +271,10 @@ class GdbServer {
               sessionId: {
                 type: 'string',
                 description: 'GDB session ID'
+              },
+              awaitStop: {
+                type: 'boolean',
+                description: 'Wait for program to stop (default: true). Set to false to return immediately.'
               }
             },
             required: ['sessionId']
@@ -229,6 +293,10 @@ class GdbServer {
               instructions: {
                 type: 'boolean',
                 description: 'Step by instructions instead of source lines (optional)'
+              },
+              awaitStop: {
+                type: 'boolean',
+                description: 'Wait for program to stop (default: true). Set to false to return immediately.'
               }
             },
             required: ['sessionId']
@@ -247,6 +315,10 @@ class GdbServer {
               instructions: {
                 type: 'boolean',
                 description: 'Step by instructions instead of source lines (optional)'
+              },
+              awaitStop: {
+                type: 'boolean',
+                description: 'Wait for program to stop (default: true). Set to false to return immediately.'
               }
             },
             required: ['sessionId']
@@ -261,6 +333,10 @@ class GdbServer {
               sessionId: {
                 type: 'string',
                 description: 'GDB session ID'
+              },
+              awaitStop: {
+                type: 'boolean',
+                description: 'Wait for program to stop (default: true). Set to false to return immediately.'
               }
             },
             required: ['sessionId']
@@ -333,6 +409,24 @@ class GdbServer {
           }
         },
         {
+          name: 'gdb_interrupt',
+          description: 'Interrupt execution (send SIGINT). Use SIGINT (default) for reliable interruption even in synchronous mode.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sessionId: {
+                type: 'string',
+                description: 'GDB session ID'
+              },
+              useSigint: {
+                type: 'boolean',
+                description: 'Use SIGINT signal to interrupt (default: true). Recommended. If false, uses -exec-interrupt MI command, which requires "target-async on" for running targets.'
+              }
+            },
+            required: ['sessionId']
+          }
+        },
+        {
           name: 'gdb_info_registers',
           description: 'Display registers',
           inputSchema: {
@@ -349,6 +443,14 @@ class GdbServer {
             },
             required: ['sessionId']
           }
+        },
+        {
+          name: 'gdb_server_info',
+          description: 'Get MCP server information (version, start time, etc.) - useful for verifying server restart',
+          inputSchema: {
+            type: 'object',
+            properties: {}
+          }
         }
       ],
     }));
@@ -362,6 +464,8 @@ class GdbServer {
           return await this.handleGdbLoad(request.params.arguments);
         case 'gdb_command':
           return await this.handleGdbCommand(request.params.arguments);
+        case 'gdb_run':
+          return await this.handleGdbRun(request.params.arguments);
         case 'gdb_terminate':
           return await this.handleGdbTerminate(request.params.arguments);
         case 'gdb_list_sessions':
@@ -388,6 +492,10 @@ class GdbServer {
           return await this.handleGdbExamine(request.params.arguments);
         case 'gdb_info_registers':
           return await this.handleGdbInfoRegisters(request.params.arguments);
+        case 'gdb_interrupt':
+          return await this.handleGdbInterrupt(request.params.arguments);
+        case 'gdb_server_info':
+          return await this.handleGdbServerInfo();
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -400,10 +508,10 @@ class GdbServer {
   private async handleGdbStart(args: any) {
     const gdbPath = args.gdbPath || 'gdb';
     const workingDir = args.workingDir || process.cwd();
-    
+
     // Create a unique session ID
     const sessionId = Date.now().toString();
-    
+
     try {
       // Start GDB process with MI mode enabled for machine interface
       const gdbProcess = spawn(gdbPath, ['--interpreter=mi'], {
@@ -411,71 +519,114 @@ class GdbServer {
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe']
       });
-      
+
       // Create readline interface for reading GDB output
       const rl = readline.createInterface({
         input: gdbProcess.stdout,
         terminal: false
       });
-      
+
       // Create new GDB session
       const session: GdbSession = {
         process: gdbProcess,
         rl,
         ready: false,
         id: sessionId,
-        workingDir
+        workingDir,
+        tokenSequence: 1,
+        pendingCommands: new Map(),
+        status: 'stopped',
+        outputBuffer: ''
       };
-      
+
       // Store session in active sessions map
       activeSessions.set(sessionId, session);
-      
-      // Collect GDB output until ready
-      let outputBuffer = '';
-      
-      // Wait for GDB to be ready (when it outputs the initial prompt)
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('GDB start timeout'));
-        }, 10000); // 10 second timeout
+
+      // Set up MI output parsing loop
+      rl.on('line', (line) => {
+        const parsed = MiParser.parse(line);
+        if (!parsed) return;
+
+        if (parsed.type === 'result') {
+          const token = parsed.data.token;
+          if (token && session.pendingCommands.has(token)) {
+            const resolve = session.pendingCommands.get(token)!;
+            session.pendingCommands.delete(token);
+            resolve(parsed.data);
+          }
+        } else if (parsed.type === 'async') {
+          // Send notification for async events
+          if (parsed.data.type === 'exec') {
+            this.server.notification({
+              method: `gdb/${parsed.data.class}`,
+              params: {
+                sessionId: session.id,
+                data: parsed.data.data
+              }
+            });
+          }
+
+          // Handle *stopped, *running, etc.
+          if (parsed.data.type === 'exec' && parsed.data.class === 'stopped') {
+            session.status = 'stopped';
+            if (session.stopHandler) {
+              session.stopHandler(parsed.data);
+              session.stopHandler = undefined;
+            }
+          } else if (parsed.data.type === 'exec' && parsed.data.class === 'running') {
+            session.status = 'running';
+          }
+                  } else if (parsed.type === 'stream') {
+                    // Accumulate console and target output
+                    if (parsed.data.type === 'console' || parsed.data.type === 'target') {
+                      session.outputBuffer += parsed.data.content;
+                    }
         
-        rl.on('line', (line) => {
-          // Append line to output buffer
-          outputBuffer += line + '\n';
-          
-          // Check if GDB is ready (outputs prompt)
-          if (line.includes('(gdb)') || line.includes('^done')) {
-            clearTimeout(timeout);
+        } else if (parsed.type === 'prompt') {
+          // (gdb) prompt - indicate ready if not already
+          if (!session.ready) {
             session.ready = true;
+          }
+        }
+      });
+
+      // Wait for GDB to be ready
+      await new Promise<void>((resolve, reject) => {
+        const checkReady = setInterval(() => {
+          if (session.ready) {
+            clearInterval(checkReady);
             resolve();
           }
-        });
-        
-        gdbProcess.stderr.on('data', (data) => {
-          outputBuffer += `[stderr] ${data.toString()}\n`;
-        });
-        
+        }, 100);
+
+        // Timeout after 10s
+        setTimeout(() => {
+          clearInterval(checkReady);
+          if (!session.ready) reject(new Error('GDB start timeout'));
+        }, 10000);
+
         gdbProcess.on('error', (err) => {
-          clearTimeout(timeout);
+          clearInterval(checkReady);
           reject(err);
         });
-        
+
         gdbProcess.on('exit', (code) => {
-          clearTimeout(timeout);
+          clearInterval(checkReady);
           if (!session.ready) {
             reject(new Error(`GDB process exited with code ${code}`));
           }
         });
       });
-      
+
       return {
         content: [
           {
             type: 'text',
-            text: `GDB session started with ID: ${sessionId}\n\nOutput:\n${outputBuffer}`
+            text: `GDB session started with ID: ${sessionId}`
           }
         ]
       };
+
     } catch (error) {
       // Clean up if an error occurs
       if (activeSessions.has(sessionId)) {
@@ -484,7 +635,7 @@ class GdbServer {
         session.rl.close();
         activeSessions.delete(sessionId);
       }
-      
+
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
         content: [
@@ -500,7 +651,7 @@ class GdbServer {
 
   private async handleGdbLoad(args: any) {
     const { sessionId, program, arguments: programArgs = [] } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -512,29 +663,32 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Normalize path if working directory is set
-      const normalizedPath = session.workingDir && !path.isAbsolute(program) 
+      const normalizedPath = session.workingDir && !path.isAbsolute(program)
         ? path.resolve(session.workingDir, program)
         : program;
-      
+
       // Update session target
       session.target = normalizedPath;
-      
+
       // Execute file command to load program
-      const loadCommand = `file "${normalizedPath}"`;
-      const loadOutput = await this.executeGdbCommand(session, loadCommand);
-      
+      // Use -file-exec-and-symbols (verified to work with GDB 9.2)
+      const loadCommand = `file-exec-and-symbols "${normalizedPath}"`;
+      const { output: loadOutput } = await this.executeGdbCommand(session, loadCommand);
+
       // Set program arguments if provided
       let argsOutput = '';
       if (programArgs.length > 0) {
-        const argsCommand = `set args ${programArgs.join(' ')}`;
-        argsOutput = await this.executeGdbCommand(session, argsCommand);
+        // Use MI command -exec-arguments
+        const argsCommand = `exec-arguments ${programArgs.join(' ')}`;
+        const { output } = await this.executeGdbCommand(session, argsCommand);
+        argsOutput = output;
       }
-      
+
       return {
         content: [
           {
@@ -558,8 +712,8 @@ class GdbServer {
   }
 
   private async handleGdbCommand(args: any) {
-    const { sessionId, command } = args;
-    
+    const { sessionId, command, isMiCommand } = args;
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -571,12 +725,21 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      const output = await this.executeGdbCommand(session, command);
-      
+      let commandToExecute = command;
+      // If it's not a raw MI command, wrap it in interpreter-exec console
+      // This allows users to run normal GDB commands like "source", "list", etc.
+      if (!isMiCommand) {
+        const escapedCommand = command.replace(/"/g, '\\"');
+        commandToExecute = `interpreter-exec console "${escapedCommand}"`;
+      }
+
+      // Send command directly as MI command (no wrapper)
+      const { output } = await this.executeGdbCommand(session, commandToExecute);
+
       return {
         content: [
           {
@@ -599,9 +762,9 @@ class GdbServer {
     }
   }
 
-  private async handleGdbTerminate(args: any) {
-    const { sessionId } = args;
-    
+  private async handleGdbRun(args: any) {
+    const { sessionId, arguments: programArgs = [], awaitStop = true } = args;
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -613,10 +776,73 @@ class GdbServer {
         isError: true
       };
     }
-    
+
+    const session = activeSessions.get(sessionId)!;
+
+    try {
+      // Set arguments if provided
+      if (programArgs.length > 0) {
+        const argsCommand = `exec-arguments ${programArgs.join(' ')}`;
+        await this.executeGdbCommand(session, argsCommand);
+      }
+
+      // Execute run command
+      await this.executeGdbCommand(session, "exec-run");
+
+      if (!awaitStop) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Program running (Async).`
+            }
+          ]
+        };
+      }
+
+      // Wait for stop (e.g. breakpoint)
+      const stopRecord = await this.waitForStop(session);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Program running. Stopped at: ${stopRecord.data.reason || 'unknown'}\n\n${JSON.stringify(stopRecord.data, null, 2)}`
+          }
+        ]
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to run program: ${errorMessage}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+
+  private async handleGdbTerminate(args: any) {
+    const { sessionId } = args;
+
+    if (!activeSessions.has(sessionId)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No active GDB session with ID: ${sessionId}`
+          }
+        ],
+        isError: true
+      };
+    }
+
     try {
       await this.terminateGdbSession(sessionId);
-      
+
       return {
         content: [
           {
@@ -645,7 +871,7 @@ class GdbServer {
       target: session.target || 'No program loaded',
       workingDir: session.workingDir || process.cwd()
     }));
-    
+
     return {
       content: [
         {
@@ -656,9 +882,49 @@ class GdbServer {
     };
   }
 
+  private async handleGdbServerInfo() {
+    // Read package.json for version info
+    let version = '0.1.1';
+    try {
+      const packageJsonPath = path.join(path.dirname(new URL(import.meta.url).pathname), '../package.json');
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+      version = packageJson.version;
+    } catch (error) {
+      // If we can't read package.json, use hardcoded version
+    }
+
+    // Get build time from the built file's modification time
+    let buildTime = 'Unknown';
+    try {
+      const buildFilePath = path.join(path.dirname(new URL(import.meta.url).pathname), 'index.js');
+      const stats = fs.statSync(buildFilePath);
+      buildTime = stats.mtime.toISOString();
+    } catch (error) {
+      // If we can't get build time, leave it as Unknown
+    }
+
+    const info = {
+      version,
+      serverStartTime: SERVER_START_TIME,
+      buildTime,
+      activeSessions: activeSessions.size,
+      nodeVersion: process.version,
+      platform: process.platform
+    };
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `MCP GDB Server Information:\n\n${JSON.stringify(info, null, 2)}\n\n✅ Server Start Time: ${SERVER_START_TIME}\n📦 Version: ${version}\n🔨 Build Time: ${buildTime}\n🔧 Active Sessions: ${activeSessions.size}`
+        }
+      ]
+    };
+  }
+
   private async handleGdbAttach(args: any) {
     const { sessionId, pid } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -670,12 +936,13 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      const output = await this.executeGdbCommand(session, `attach ${pid}`);
-      
+      // Use MI command -target-attach
+      const { output } = await this.executeGdbCommand(session, `target-attach ${pid}`);
+
       return {
         content: [
           {
@@ -700,7 +967,7 @@ class GdbServer {
 
   private async handleGdbLoadCore(args: any) {
     const { sessionId, program, corePath } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -712,19 +979,29 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // First load the program
-      const fileOutput = await this.executeGdbCommand(session, `file "${program}"`);
-      
+      let fileOutput = '';
+      if (true) {
+        // Strict MI
+        const { output } = await this.executeGdbCommand(session, `file-exec-and-symbols "${program}"`);
+        fileOutput = output;
+      } else {
+        // Use interpreter-exec console "file"
+        const { output } = await this.executeGdbCommand(session, `interpreter-exec console "file \\"${program}\\""`);
+        fileOutput = output;
+      }
+
       // Then load the core file
-      const coreOutput = await this.executeGdbCommand(session, `core-file "${corePath}"`);
-      
+      // GDB/MI usually doesn't have a direct core-file command, use interpreter-exec
+      const { output: coreOutput } = await this.executeGdbCommand(session, `interpreter-exec console "core-file \\"${corePath}\\""`);
+
       // Get backtrace to show initial state
-      const backtraceOutput = await this.executeGdbCommand(session, "backtrace");
-      
+      const { output: backtraceOutput } = await this.executeGdbCommand(session, 'interpreter-exec console "backtrace"');
+
       return {
         content: [
           {
@@ -749,7 +1026,7 @@ class GdbServer {
 
   private async handleGdbSetBreakpoint(args: any) {
     const { sessionId, location, condition } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -761,26 +1038,30 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      // Set breakpoint
-      let command = `break ${location}`;
-      const output = await this.executeGdbCommand(session, command);
-      
+      // Set breakpoint using MI -break-insert
+      // If location is file:line, we use it directly. If it's function, same.
+      // -break-insert [location]
+      const { result, output } = await this.executeGdbCommand(session, `break-insert ${location}`);
+
+      // Parse breakpoint info from result (bkpt={number="1",...})
+      let bpNum = '';
+      if (result.data && result.data.bkpt) {
+        bpNum = result.data.bkpt.number;
+      }
+
       // Set condition if provided
       let conditionOutput = '';
-      if (condition) {
-        // Extract breakpoint number from output (assumes format like "Breakpoint 1 at...")
-        const match = output.match(/Breakpoint (\d+)/);
-        if (match && match[1]) {
-          const bpNum = match[1];
-          const conditionCommand = `condition ${bpNum} ${condition}`;
-          conditionOutput = await this.executeGdbCommand(session, conditionCommand);
-        }
+      if (condition && bpNum) {
+        // -break-condition Number Expr
+        const conditionCommand = `break-condition ${bpNum} ${condition}`;
+        const { output } = await this.executeGdbCommand(session, conditionCommand);
+        conditionOutput = output;
       }
-      
+
       return {
         content: [
           {
@@ -804,172 +1085,303 @@ class GdbServer {
   }
 
   private async handleGdbContinue(args: any) {
-    const { sessionId } = args;
-    
+    const { sessionId, awaitStop = true } = args;
+
     if (!activeSessions.has(sessionId)) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
+        content: [{ type: 'text', text: `No active GDB session with ID: ${sessionId}` }],
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      const output = await this.executeGdbCommand(session, "continue");
-      
-      return {
-        content: [
-          {
+      // 1. Send continue command (expect ^running immediately)
+      // Use MI command -exec-continue
+      await this.executeGdbCommand(session, "exec-continue");
+
+      if (!awaitStop) {
+        return {
+          content: [{
             type: 'text',
-            text: `Continued execution\n\nOutput:\n${output}`
-          }
-        ]
+            text: `Program execution continued (Async).`
+          }]
+        };
+      }
+
+      // 2. Wait for *stopped
+      // We wrap this in a timeout promise so we can return "Running..." if it takes too long
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 2000); // 2s wait for synchronous-feel
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Program is running... (Command successful, waiting for stop)`
+          }]
+        };
+      }
+
+      // Program stopped
+      const stopRecord = result as MiAsyncRecord;
+      return {
+        content: [{
+          type: 'text',
+          text: `Program stopped. Reason: ${stopRecord.data.reason || 'unknown'}\n\n${JSON.stringify(stopRecord.data, null, 2)}`
+        }]
+      };
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Failed to continue execution: ${errorMessage}` }],
+      };
+    }
+  }
+
+  private async handleGdbInterrupt(args: any) {
+    const { sessionId, useSigint = true } = args;
+    if (!activeSessions.has(sessionId)) {
+      return {
+        content: [{ type: 'text', text: `No active GDB session with ID: ${sessionId}` }],
+        isError: true
+      };
+    }
+
+    const session = activeSessions.get(sessionId)!;
+    if (session.status === 'stopped') {
+      return {
+        content: [{
+          type: 'text',
+          text: 'Program is already stopped; no interrupt needed.'
+        }]
+      };
+    }
+    try {
+      if (useSigint) {
+        // Send interrupt via SIGINT
+        session.process.kill('SIGINT');
+      } else {
+        // Send interrupt via MI command
+        await this.executeGdbCommand(session, "exec-interrupt");
+      }
+
+      // Wait for stop, but return if it takes too long
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 2000);
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Interrupt sent (${useSigint ? 'SIGINT' : 'MI-Command'}). Waiting for stop...`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Program interrupted (${useSigint ? 'SIGINT' : 'MI-Command'}). Reason: ${stopRecord.data.reason}\n\n${JSON.stringify(stopRecord.data, null, 2)}`
+        }]
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to continue execution: ${errorMessage}`
-          }
-        ],
+        content: [{ type: 'text', text: `Failed to interrupt: ${errorMessage}` }],
         isError: true
       };
     }
   }
 
   private async handleGdbStep(args: any) {
-    const { sessionId, instructions = false } = args;
-    
+    const { sessionId, instructions = false, awaitStop = true } = args;
+
     if (!activeSessions.has(sessionId)) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
+        content: [{ type: 'text', text: `No active GDB session with ID: ${sessionId}` }],
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      // Use stepi for instruction-level stepping, otherwise step
-      const command = instructions ? "stepi" : "step";
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
+      // Use MI commands
+      const command = instructions ? "exec-step-instruction" : "exec-step";
+      // executeGdbCommand waits for ^running (or ^done if synchronous?)
+      // MI execution commands return ^running
+      await this.executeGdbCommand(session, command);
+
+      if (!awaitStop) {
+        return {
+          content: [{
             type: 'text',
-            text: `Stepped ${instructions ? 'instruction' : 'line'}\n\nOutput:\n${output}`
-          }
-        ]
+            text: `Step initiated (Async).`
+          }]
+        };
+      }
+
+      // Wait for stop with timeout
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 5000); // 5s timeout
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Step initiated but program did not stop within 5s. It might be running or waiting for input.`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Stepped ${instructions ? 'instruction' : 'line'}. Reason: ${stopRecord.data.reason}\n\n${JSON.stringify(stopRecord.data, null, 2)}`
+        }]
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to step: ${errorMessage}`
-          }
-        ],
+        content: [{ type: 'text', text: `Failed to step: ${errorMessage}` }],
         isError: true
       };
     }
   }
 
   private async handleGdbNext(args: any) {
-    const { sessionId, instructions = false } = args;
-    
+    const { sessionId, instructions = false, awaitStop = true } = args;
+
     if (!activeSessions.has(sessionId)) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
+        content: [{ type: 'text', text: `No active GDB session with ID: ${sessionId}` }],
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      // Use nexti for instruction-level stepping, otherwise next
-      const command = instructions ? "nexti" : "next";
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
+      // Use MI commands
+      const command = instructions ? "exec-next-instruction" : "exec-next";
+      await this.executeGdbCommand(session, command);
+
+      if (!awaitStop) {
+        return {
+          content: [{
             type: 'text',
-            text: `Stepped over ${instructions ? 'instruction' : 'function call'}\n\nOutput:\n${output}`
-          }
-        ]
+            text: `Next initiated (Async).`
+          }]
+        };
+      }
+
+      // Wait for stop with timeout
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 5000); // 5s timeout
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Next initiated but program did not stop within 5s. It might be running or waiting for input.`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Stepped over ${instructions ? 'instruction' : 'function call'}. Reason: ${stopRecord.data.reason}\n\n${JSON.stringify(stopRecord.data, null, 2)}`
+        }]
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to step over: ${errorMessage}`
-          }
-        ],
+        content: [{ type: 'text', text: `Failed to step over: ${errorMessage}` }],
         isError: true
       };
     }
   }
 
   private async handleGdbFinish(args: any) {
-    const { sessionId } = args;
-    
+    const { sessionId, awaitStop = true } = args;
+
     if (!activeSessions.has(sessionId)) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
+        content: [{ type: 'text', text: `No active GDB session with ID: ${sessionId}` }],
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      const output = await this.executeGdbCommand(session, "finish");
-      
-      return {
-        content: [
-          {
+      // Use MI command -exec-finish
+      await this.executeGdbCommand(session, "exec-finish");
+
+      if (!awaitStop) {
+        return {
+          content: [{
             type: 'text',
-            text: `Finished current function\n\nOutput:\n${output}`
-          }
-        ]
+            text: `Finish initiated (Async).`
+          }]
+        };
+      }
+
+      // Wait for stop with timeout
+      const stopPromise = this.waitForStop(session);
+      const timeoutPromise = new Promise<{ timeout: boolean }>((resolve) => {
+        setTimeout(() => resolve({ timeout: true }), 5000); // 5s timeout
+      });
+
+      const result: any = await Promise.race([stopPromise, timeoutPromise]);
+
+      if (result.timeout) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Finish initiated but program did not stop within 5s. It might be running or waiting for input.`
+          }]
+        };
+      }
+
+      const stopRecord = result as MiAsyncRecord;
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Finished current function. Reason: ${stopRecord.data.reason}\n\n${JSON.stringify(stopRecord.data, null, 2)}`
+        }]
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to finish function: ${errorMessage}`
-          }
-        ],
+        content: [{ type: 'text', text: `Failed to finish function: ${errorMessage}` }],
         isError: true
       };
     }
@@ -977,7 +1389,7 @@ class GdbServer {
 
   private async handleGdbBacktrace(args: any) {
     const { sessionId, full = false, limit } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -989,18 +1401,21 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Build backtrace command with options
+      // Use interpreter-exec console to maintain readable output
       let command = full ? "backtrace full" : "backtrace";
       if (typeof limit === 'number') {
         command += ` ${limit}`;
       }
-      
-      const output = await this.executeGdbCommand(session, command);
-      
+      // Wrap in interpreter-exec
+      const miCommand = `interpreter-exec console "${command}"`;
+
+      const { output } = await this.executeGdbCommand(session, miCommand);
+
       return {
         content: [
           {
@@ -1025,7 +1440,7 @@ class GdbServer {
 
   private async handleGdbPrint(args: any) {
     const { sessionId, expression } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -1037,12 +1452,13 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
-      const output = await this.executeGdbCommand(session, `print ${expression}`);
-      
+      // Use interpreter-exec console for print to get readable output
+      const { output } = await this.executeGdbCommand(session, `interpreter-exec console "print ${expression}"`);
+
       return {
         content: [
           {
@@ -1067,7 +1483,7 @@ class GdbServer {
 
   private async handleGdbExamine(args: any) {
     const { sessionId, expression, format = 'x', count = 1 } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -1079,14 +1495,15 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Format examine command: x/[count][format] [expression]
       const command = `x/${count}${format} ${expression}`;
-      const output = await this.executeGdbCommand(session, command);
-      
+      // Use interpreter-exec console
+      const { output } = await this.executeGdbCommand(session, `interpreter-exec console "${command}"`);
+
       return {
         content: [
           {
@@ -1111,7 +1528,7 @@ class GdbServer {
 
   private async handleGdbInfoRegisters(args: any) {
     const { sessionId, register } = args;
-    
+
     if (!activeSessions.has(sessionId)) {
       return {
         content: [
@@ -1123,14 +1540,14 @@ class GdbServer {
         isError: true
       };
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     try {
       // Build info registers command, optionally with specific register
       const command = register ? `info registers ${register}` : `info registers`;
-      const output = await this.executeGdbCommand(session, command);
-      
+      const { output } = await this.executeGdbCommand(session, `interpreter-exec console "${command}"`);
+
       return {
         content: [
           {
@@ -1156,65 +1573,81 @@ class GdbServer {
   /**
    * Execute a GDB command and wait for the response
    */
-  private executeGdbCommand(session: GdbSession, command: string): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
+  private executeGdbCommand(session: GdbSession, command: string): Promise<{ result: MiResult; output: string }> {
+    return new Promise<{ result: MiResult; output: string }>((resolve, reject) => {
       if (!session.ready) {
         reject(new Error('GDB session is not ready'));
         return;
       }
-      
-      // Write command to GDB's stdin
+
+      const token = session.tokenSequence++;
+      // Clear previous output buffer to capture only this command's output
+      session.outputBuffer = '';
+
+      // Setup promise for command result
+      session.pendingCommands.set(token, (result: MiResult) => {
+        if (result.class === 'error') {
+          reject(new Error(result.data.msg || 'Unknown GDB error'));
+        } else {
+          resolve({
+            result,
+            output: session.outputBuffer
+          });
+        }
+      });
+
+      // Write command to GDB's stdin with token
       if (session.process.stdin) {
-        session.process.stdin.write(command + '\n');
+        const commandToSend = command.startsWith('-') ? command.substring(1) : command;
+        session.process.stdin.write(`${token}-${commandToSend}\n`);
       } else {
+        session.pendingCommands.delete(token);
         reject(new Error('GDB stdin is not available'));
         return;
       }
-      
-      let output = '';
-      let responseComplete = false;
-      
-      // Create a one-time event handler for GDB output
-      const onLine = (line: string) => {
-        output += line + '\n';
-        
-        // Check if this line indicates the end of the GDB response
-        if (line.includes('(gdb)') || line.includes('^done') || line.includes('^error')) {
-          responseComplete = true;
-          
-          // If we've received the complete response, resolve the promise
-          if (responseComplete) {
-            // Remove the listener to avoid memory leaks
-            session.rl.removeListener('line', onLine);
-            resolve(output);
-          }
+
+      // Set a timeout
+      // Execution commands like -exec-continue might take time to return ^running?
+      // No, ^running comes reasonably fast. *stopped comes later.
+      // So 10s timeout for the *acknowledgment* is fine.
+      setTimeout(() => {
+        if (session.pendingCommands.has(token)) {
+          session.pendingCommands.delete(token);
+          reject(new Error('GDB command timed out'));
         }
-      };
-      
-      // Add the line handler to the readline interface
-      session.rl.on('line', onLine);
-      
-      // Set a timeout to prevent hanging
-      const timeout = setTimeout(() => {
-        session.rl.removeListener('line', onLine);
-        reject(new Error('GDB command timed out'));
-      }, 10000); // 10 second timeout
-      
-      // Handle GDB errors
-      const errorHandler = (data: Buffer) => {
-        const errorText = data.toString();
-        output += `[stderr] ${errorText}\n`;
-      };
-      
-      // Add error handler
-      if (session.process.stderr) {
-        session.process.stderr.once('data', errorHandler);
-      }
-      
-      // Clean up event handlers when the timeout expires
-      timeout.unref();
+      }, 10000); // 10s default
     });
   }
+
+  /**
+   * Wait for specific async stop event
+   */
+  private waitForStop(session: GdbSession): Promise<MiAsyncRecord> {
+    return new Promise<MiAsyncRecord>((resolve, reject) => {
+      if (session.status === 'stopped') {
+        // Already stopped?
+        // resolve({ type: 'exec', class: 'stopped', data: {} }); 
+        // Wait, maybe we just switched to running.
+      }
+
+      session.stopHandler = (record) => {
+        resolve(record);
+      };
+
+      // Timeout for stop? (e.g. infinite loop protection)
+      // For now let's make it infinite or long timeout? 
+      // The user requested NO timeout for execution, but we should probably have a manual way to cancel.
+      // The MCP tool call `gdb_continue` needs to return eventually.
+      // If the program runs forever, `gdb_continue` will hang.
+      // We should probably return a "Running..." status if it takes too long? 
+      // But the user complained about "premature timeout".
+      // Let's implement a very long timeout or let it hang until user cancels?
+      // For an Agent, hanging 1 hour is bad.
+      // Let's put 60s timeout? Or just rely on the Agent to be patient.
+      // Re-reading plan: "If an execution command times out ... return specific message ... rather than error"
+    });
+  }
+
 
   /**
    * Terminate a GDB session
@@ -1223,24 +1656,24 @@ class GdbServer {
     if (!activeSessions.has(sessionId)) {
       throw new Error(`No active GDB session with ID: ${sessionId}`);
     }
-    
+
     const session = activeSessions.get(sessionId)!;
-    
+
     // Send quit command to GDB
     try {
-      await this.executeGdbCommand(session, 'quit');
+      await this.executeGdbCommand(session, '-gdb-exit');
     } catch (error) {
       // Ignore errors from quit command, we'll force kill if needed
     }
-    
+
     // Force kill the process if it's still running
     if (!session.process.killed) {
       session.process.kill();
     }
-    
+
     // Close the readline interface
     session.rl.close();
-    
+
     // Remove from active sessions
     activeSessions.delete(sessionId);
   }
