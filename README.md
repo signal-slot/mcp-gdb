@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/signal-slot-mcp-gdb-badge.png)](https://mseep.ai/app/signal-slot-mcp-gdb)
+
 # MCP GDB Server
 
 [![npm version](https://img.shields.io/npm/v/mcp-gdb.svg)](https://www.npmjs.com/package/mcp-gdb)
