@@ -1205,6 +1205,9 @@ class GdbServer {
       // If we got valid source information, return it in a structured format
       if (sourceInfo.filePath) {
         return {
+          debug: {
+            sourceInfo
+          },
           content: [
             {
               type: 'text',
@@ -1215,7 +1218,8 @@ class GdbServer {
               filePath: sourceInfo.filePath,
               lineStart: sourceInfo.lineStart, 
               vscodeUri: `vscode://file${sourceInfo.filePath}:${sourceInfo.lineStart}`,
-              lineEnd: sourceInfo.lineEnd
+              lineEnd: sourceInfo.lineEnd,
+              currentLine: sourceInfo.currentLine
             }
           ]
         };
@@ -1247,9 +1251,9 @@ class GdbServer {
   /**
    * Parse GDB output to extract source code file path and line range
    */
-  private async parseSourceInfoFromGdbOutput(session: GdbSession, output: string): Promise<{ filePath: string, lineStart: number, lineEnd: number }> {
+  private async parseSourceInfoFromGdbOutput(session: GdbSession, output: string): Promise<{ filePath: string, lineStart: number, lineEnd: number, currentLine: number }> {
     // Default return value when parsing fails
-    const defaultResult = { filePath: '', lineStart: 0, lineEnd: 0 };
+    const defaultResult = { filePath: '', lineStart: 0, lineEnd: 0, currentLine: 0 };
     
     // Check if the output contains source lines
     if (!output.trim()) {
@@ -1257,10 +1261,30 @@ class GdbServer {
     }
     
     try {
-      // First, try to extract the file path and line numbers from the list output
+      // First, get the current location using 'info line'
+      // This gives us both the file and the current line in a reliable way
+      const infoLineOutput = await this.executeGdbCommand(session, 'info line');
+      
+      // Parse the file path and line number from info line output
+      // Example output: "Line 17 of \"crash.c\" starts at address 0x1149 <main+0> and ends at 0x1155 <main+12>."
+      const infoLineMatch = infoLineOutput.match(/Line (\d+) of "([^"]+)"/);
+      
+      let filePath = '';
+      let currentLine = 0;
+      
+      if (infoLineMatch) {
+        currentLine = parseInt(infoLineMatch[1], 10);
+        filePath = infoLineMatch[2];
+      } else {
+        // Fallback to info source if info line doesn't work
+        const infoOutput = await this.executeGdbCommand(session, 'info source');
+        const filePathMatch = infoOutput.match(/Current source file is (.*?)(?: |$)/);
+        filePath = filePathMatch ? filePathMatch[1] : '';
+      }
+      
+      // Now extract the line numbers from the list output
       // Format for GDB list output is usually line numbers followed by the code:
       // 10     void function_with_args(int a, int b) {
-      
       const lines = output.split('\n').filter(line => line.trim());
       
       // Detect if there's source code in the output
@@ -1276,15 +1300,11 @@ class GdbServer {
       const lastLineMatch = sourceLines[sourceLines.length - 1].match(/^\s*(\d+)\s+/);
       
       if (firstLineMatch && lastLineMatch) {
-        // If we couldn't extract line numbers, get the current source file
-        const infoOutput = await this.executeGdbCommand(session, 'info source');
-        const filePathMatch = infoOutput.match(/Current source file is (.*?)(?: |$)/);
-        const filePath = filePathMatch ? filePathMatch[1] : '';
-        
         return {
           filePath,
           lineStart: parseInt(firstLineMatch[1], 10),
-          lineEnd: parseInt(lastLineMatch[1], 10)
+          lineEnd: parseInt(lastLineMatch[1], 10),
+          currentLine
         };
       }
     } catch (e) {

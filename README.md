@@ -16,25 +16,30 @@ A Model Context Protocol (MCP) server that provides GDB debugging functionality 
 
 ## Installation
 
-### Option 1: Install from NPM
+### Claude Code
 
 ```bash
-npm install mcp-gdb
+claude mcp add gdb -- npx -y mcp-gdb
 ```
 
-You can use the package in your Node.js project:
+### Claude Desktop
 
-```javascript
-import { startGdbServer } from 'mcp-gdb';
+Add the following to your Claude Desktop MCP configuration:
 
-// Start the server programmatically
-startGdbServer();
+```json
+{
+  "mcpServers": {
+    "gdb": {
+      "command": "npx",
+      "args": ["-y", "mcp-gdb"]
+    }
+  }
+}
 ```
 
-### Option 2: Install from Source
+### Install from Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/signal-slot/mcp-gdb.git
 cd mcp-gdb
 npm install
@@ -42,40 +47,6 @@ npm run build
 ```
 
 ## Usage
-
-### Using with Claude or other MCP-enabled assistants
-
-1. Configure the MCP settings in the Claude desktop app or browser extension to include this server:
-
-```json
-{
-  "mcpServers": {
-    "gdb": {
-      "command": "node", 
-      "args": ["/path/to/mcp-gdb/build/index.js"],
-      "disabled": false
-    }
-  }
-}
-```
-
-If you installed via NPM, you can reference the package in node_modules:
-
-```json
-{
-  "mcpServers": {
-    "gdb": {
-      "command": "node",
-      "args": ["node_modules/mcp-gdb/build/index.js"],
-      "disabled": false
-    }
-  }
-}
-```
-
-2. Restart Claude or refresh the page.
-
-3. Now you can use the GDB tools in your conversations with Claude.
 
 ### Example Commands
 
@@ -115,17 +86,6 @@ Use gdb_backtrace to see the current call stack
 ```
 Use gdb_terminate to end the debugging session
 ```
-
-## NPM Package Information
-
-The `mcp-gdb` package is available on [npm](https://www.npmjs.com/package/mcp-gdb) and provides all the functionality needed to integrate GDB debugging with MCP-enabled AI assistants.
-
-- **Current Version**: 0.1.1
-- **Main**: build/index.js
-- **Type**: ESM module
-- **License**: MIT
-- **Keywords**: gdb, debug, mcp
-- **Repository**: [GitHub](https://github.com/signal-slot/mcp-gdb)
 
 ## Supported GDB Commands
 

@@ -4,6 +4,9 @@
   "description": "MCP server for GDB debugging functionality",
   "type": "module",
   "main": "build/index.js",
+  "bin": {
+    "mcp-gdb": "build/index.js"
+  },
   "scripts": {
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "start": "node build/index.js",
