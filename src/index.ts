@@ -71,6 +71,13 @@ class GdbServer {
               workingDir: {
                 type: 'string',
                 description: 'Working directory for GDB (optional)'
+              },
+              arguments: {
+                type: 'array',
+                items: {
+                  type: 'string'
+                },
+                description: 'Command-line arguments for GDB (optional)'
               }
             }
           }
@@ -371,6 +378,43 @@ class GdbServer {
             },
             required: ['sessionId']
           }
+        },
+        {
+          name: 'gdb_reverse_continue',
+          description: 'Reverse continue program execution',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sessionId: {
+                type: 'string',
+                description: 'GDB session ID'
+              }
+            },
+            required: ['sessionId']
+          }
+        },
+        {
+          name: 'gdb_watch',
+          description: 'Set a watchpoint on a memory address or expression',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sessionId: {
+                type: 'string',
+                description: 'GDB session ID'
+              },
+              expression: {
+                type: 'string',
+                description: 'Expression or address to watch (e.g., "*0x1234", "variable")'
+              },
+              type: {
+                type: 'string',
+                enum: ['write', 'read', 'access'],
+                description: 'Type of watchpoint: write (watch), read (rwatch), or access (awatch). Defaults to write.'
+              }
+            },
+            required: ['sessionId', 'expression']
+          }
         }
       ],
     }));
@@ -412,6 +456,10 @@ class GdbServer {
           return await this.handleGdbInfoRegisters(request.params.arguments);
         case 'gdb_list_source':
           return await this.handleGdbListSource(request.params.arguments);
+        case 'gdb_reverse_continue':
+          return await this.handleGdbReverseContinue(request.params.arguments);
+        case 'gdb_watch':
+          return await this.handleGdbWatch(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -429,8 +477,11 @@ class GdbServer {
     const sessionId = Date.now().toString();
     
     try {
+      // Prepare command arguments, ensuring MI mode is enabled
+      const commandArgs = [...(args.arguments || []), '--interpreter=mi'];
+
       // Start GDB process with MI mode enabled for machine interface
-      const gdbProcess = spawn(gdbPath, ['--interpreter=mi'], {
+      const gdbProcess = spawn(gdbPath, commandArgs, {
         cwd: workingDir,
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe']
@@ -1404,6 +1455,104 @@ class GdbServer {
     
     // Remove from active sessions
     activeSessions.delete(sessionId);
+  }
+
+  private async handleGdbReverseContinue(args: any) {
+    const { sessionId } = args;
+    
+    if (!activeSessions.has(sessionId)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No active GDB session with ID: ${sessionId}`
+          }
+        ],
+        isError: true
+      };
+    }
+    
+    const session = activeSessions.get(sessionId)!;
+    
+    try {
+      const output = await this.executeGdbCommand(session, "reverse-continue");
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Reverse continued execution\n\nOutput:\n${output}`
+          }
+        ]
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to reverse continue execution: ${errorMessage}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+
+  private async handleGdbWatch(args: any) {
+    const { sessionId, expression, type = 'write' } = args;
+    
+    if (!activeSessions.has(sessionId)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No active GDB session with ID: ${sessionId}`
+          }
+        ],
+        isError: true
+      };
+    }
+    
+    const session = activeSessions.get(sessionId)!;
+    
+    try {
+      let command = '';
+      switch (type) {
+        case 'read':
+          command = `rwatch -l ${expression}`;
+          break;
+        case 'access':
+          command = `awatch -l ${expression}`;
+          break;
+        case 'write':
+        default:
+          command = `watch -l ${expression}`;
+          break;
+      }
+      
+      const output = await this.executeGdbCommand(session, command);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Watchpoint set on ${expression} (type: ${type})\n\nOutput:\n${output}`
+          }
+        ]
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to set watchpoint: ${errorMessage}`
+          }
+        ],
+        isError: true
+      };
+    }
   }
 
   async run() {
