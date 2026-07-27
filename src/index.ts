@@ -1517,17 +1517,20 @@ class GdbServer {
     const session = activeSessions.get(sessionId)!;
     
     try {
+      // No -l: it resolves the address immediately, so a watchpoint set on a
+      // global before `run` watches the pre-relocation address of a PIE binary
+      // and never triggers.
       let command = '';
       switch (type) {
         case 'read':
-          command = `rwatch -l ${expression}`;
+          command = `rwatch ${expression}`;
           break;
         case 'access':
-          command = `awatch -l ${expression}`;
+          command = `awatch ${expression}`;
           break;
         case 'write':
         default:
-          command = `watch -l ${expression}`;
+          command = `watch ${expression}`;
           break;
       }
       
