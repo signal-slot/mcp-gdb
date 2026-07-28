@@ -1,7 +1,6 @@
 # Build artifacts
 build/
 node_modules/
-package-lock.json
 
 # IDE files
 .vscode/
